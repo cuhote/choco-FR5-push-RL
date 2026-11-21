@@ -19,6 +19,21 @@ class Fr5PushEnv(DirectRLEnv):
     def __init__(self, cfg: Fr5PushEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
         self._hold_pos = self.robot.data.default_joint_pos.clone()  # 그리퍼 대기 자세
+        self._j = {name: self.robot.find_joints(name)[0][0] for name in ("px", "py", "pz", "yaw")}
+        self._fingers = self.robot.find_joints("finger_.*")[0]
+
+        # 밀기 1회 계획 (환경마다)
+        n = self.num_envs
+        self._start = torch.zeros(n, 2, device=self.device)  # 시작점 (트레이 중심 기준)
+        self._dir = torch.zeros(n, 2, device=self.device)  # 미는 방향 단위벡터
+        self._dist = torch.zeros(n, device=self.device)  # 미는 거리
+        self._yaw = torch.zeros(n, device=self.device)  # 그리퍼 yaw
+        self._sub = 0  # 밀기 1회 안에서 몇 번째 물리 스텝인지
+        # 결과 기록 (_get_dones 에서 채움. 리셋 전에 읽을 수 있게 따로 보관)
+        self.push_count = torch.zeros(n, dtype=torch.long, device=self.device)
+        self.landed_on_cube = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.success = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.failed = torch.zeros(n, dtype=torch.bool, device=self.device)
 
     # ------------------------------------------------------------------ 장면
     def _setup_scene(self):
@@ -47,14 +62,119 @@ class Fr5PushEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-    # ------------------------------------------------------------------ 행동 (C단계: 그리퍼는 대기)
+    # ------------------------------------------------------------------ 행동: 밀기 1회
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        self.actions = actions.clone()
+        """행동 [-1,1] x4 -> 밀기 계획. 그리퍼를 시작점 위로 순간 이동."""
+        cfg = self.cfg
+        a = actions.clamp(-1.0, 1.0)
+        self.actions = a.clone()
+        target_xy = self.cubes.data.object_pos_w[:, 0, :2] - self.scene.env_origins[:, :2]
+
+        self._start = target_xy + a[:, 0:2] * cfg.start_range
+        theta = a[:, 2] * math.pi
+        self._dir = torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)
+        lo, hi = cfg.push_dist_range
+        self._dist = lo + (a[:, 3] + 1.0) / 2.0 * (hi - lo)
+        # 손가락 Y면(평평한 면)이 미는 방향을 보게: yaw = theta + 90°. 양쪽 Y면이 같으니 [-90°, 90°)로
+        self._yaw = torch.remainder(theta + math.pi, math.pi) - math.pi / 2
+
+        jp = self._joint_targets(self._start, self.cfg.safe_tip_z)
+        self.robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
+        self.robot.set_joint_position_target(jp)
+        self._sub = 0
+        self.push_count += 1
 
     def _apply_action(self) -> None:
-        self.robot.set_joint_position_target(self._hold_pos)
+        """물리 스텝마다 호출: 시간표대로 관절 목표 위치를 준다."""
+        cfg = self.cfg
+        t = self._sub * self.physics_dt
+        self._sub += 1
+        t1 = cfg.t_descend
+        t2 = t1 + cfg.t_push
+        t3 = t2 + cfg.t_lift
+        if t < t1:  # 내려가기
+            tip = cfg.safe_tip_z + (cfg.push_tip_z - cfg.safe_tip_z) * t / t1
+        elif t < t2:  # 밀기
+            tip = cfg.push_tip_z
+        elif t < t3:  # 들기
+            tip = cfg.push_tip_z + (cfg.safe_tip_z - cfg.push_tip_z) * (t - t2) / cfg.t_lift
+        else:  # 안정 대기
+            tip = cfg.safe_tip_z
+        s = ((t - t1) * cfg.push_speed) * torch.ones_like(self._dist)
+        s = torch.minimum(s.clamp(min=0.0), self._dist)
+        xy = self._start + self._dir * s[:, None]
+        self.robot.set_joint_position_target(self._joint_targets(xy, tip))
 
-    # ------------------------------------------------------------------ 관측/보상/종료 (C단계: 임시)
+        # 내려가기 끝 + 0.1초 (관절이 목표를 따라잡을 시간): 손가락 끝이 목표 높이에 못 갔으면 큐브 위에 내려앉은 것
+        if self._sub == round((t1 + 0.1) / self.physics_dt):
+            tip_now = self.robot.data.joint_pos[:, self._j["pz"]] - cfg.tcp_offset
+            self.landed_on_cube = tip_now > cfg.push_tip_z + cfg.landed_tol
+
+    def _joint_targets(self, xy: torch.Tensor, tip_z: float) -> torch.Tensor:
+        jp = self._hold_pos.clone()
+        jp[:, self._j["px"]] = xy[:, 0]
+        jp[:, self._j["py"]] = xy[:, 1]
+        jp[:, self._j["pz"]] = tip_z + self.cfg.tcp_offset
+        jp[:, self._j["yaw"]] = self._yaw
+        jp[:, self._fingers] = 0.0  # 손가락 닫기
+        return jp
+
+    # ------------------------------------------------------------------ 현재 큐브 상태 (2D)
+    def cubes_2d(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """트레이 중심 기준 xy (n,k,2), yaw (n,k), 바로 놓였는지 (n,k), 높이 z (n,k)."""
+        p = self.cubes.data.object_pos_w
+        xy = p[..., :2] - self.scene.env_origins[:, None, :2]
+        w, x, y, z = self.cubes.data.object_quat_w.unbind(-1)
+        # 회전행렬의 열 = 큐브의 x, y, z 축 (월드 기준). 3번째 행 = 각 축의 z 성분
+        ax = torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)], -1)
+        ay = torch.stack([2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)], -1)
+        az_z = 1 - 2 * (x * x + y * y)
+        # 정육면체는 어느 면이 위로 가도 같은 모양 -> 세 축 중 하나라도 거의 수직이면 바로 놓인 것
+        up = torch.stack([ax[..., 2].abs(), ay[..., 2].abs(), az_z.abs()], -1).max(-1).values
+        upright = up > math.cos(math.radians(self.cfg.tilt_fail_deg))
+        # yaw: 수평에 가까운 축 하나로 계산
+        h = torch.where((ax[..., 2].abs() < 0.7)[..., None], ax, ay)
+        yaw = torch.atan2(h[..., 1], h[..., 0])
+        return xy, yaw, upright, p[..., 2]
+
+    # ------------------------------------------------------------------ D단계: 규칙 기반 밀기
+    def demo_push_action(self, push_dist: float = 0.035) -> torch.Tensor:
+        """규칙: 대상에 가장 가까운 이웃을, 대상-이웃 선과 직각 방향으로 밀어 대상 옆에서 비켜나게 한다.
+
+        그리퍼는 이웃의 옆면(틈이 아닌 쪽) 바깥 빈 바닥에 내린다. 양쪽 중 내릴 자리가 비어 있는 쪽을 고른다.
+        반환: 행동 (n, 4) [-1, 1]
+        """
+        cfg = self.cfg
+        h = CUBE / 2
+        foot = (0.0105, 0.0105)  # 닫힌 손가락이 차지하는 바닥 면적 (반 크기)
+        xy, yaw, _, _ = self.cubes_2d()
+        n = xy.shape[0]
+        ar = torch.arange(n, device=self.device)
+        c = xy[:, 0]
+        d = xy[:, 1:] - c[:, None]
+        j = torch.linalg.norm(d, dim=-1).argmin(dim=1)  # 가장 가까운 이웃
+        pj, yj = xy[:, 1:][ar, j], yaw[:, 1:][ar, j]
+        v = d[ar, j] / torch.linalg.norm(d[ar, j], dim=-1, keepdim=True)  # 대상 -> 이웃
+
+        lo, hi = cfg.push_dist_range
+        action, ok = None, None
+        for sgn in (1.0, -1.0):
+            w = sgn * torch.stack([-v[:, 1], v[:, 0]], dim=-1)  # 직각 방향 = 미는 방향
+            th = torch.atan2(w[:, 1], w[:, 0])
+            start = pj - w * (_extent(yj, (h, h), th)[:, None] + foot[0] + 0.003)  # 이웃 옆면 바깥 3mm
+            free = _rect_inside_tray(start, th, foot, *cfg.tray_inner_half)
+            free &= ~_overlap_matrix(start[:, None], th[:, None], foot, xy, yaw)[:, 0].any(-1)
+            a = torch.zeros(n, 4, device=self.device)
+            a[:, 0:2] = (start - c) / cfg.start_range
+            a[:, 2] = th / math.pi
+            a[:, 3] = (push_dist - lo) / (hi - lo) * 2 - 1
+            if action is None:
+                action, ok = a, free
+            else:
+                action = torch.where((~ok & free)[:, None], a, action)
+        return action.clamp(-1.0, 1.0)
+
+    # ------------------------------------------------------------------ 관측/보상/종료 (E단계에서 완성)
     def _get_observations(self) -> dict:
         target_pos = self.cubes.data.object_pos_w[:, 0] - self.scene.env_origins
         return {"policy": target_pos}
@@ -63,15 +183,13 @@ class Fr5PushEnv(DirectRLEnv):
         return torch.zeros(self.num_envs, device=self.device)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.cfg.debug_print and self.common_step_counter % 30 == 0:
-            speed = torch.linalg.norm(self.cubes.data.object_lin_vel_w, dim=-1)  # (env, 18)
-            z = self.cubes.data.object_pos_w[..., 2]
-            print(
-                f"[debug] step {self.common_step_counter:5d} | cube max speed {speed.max().item() * 1000:7.2f} mm/s"
-                f" | z min {z.min().item() * 1000:6.2f} mm, max {z.max().item() * 1000:6.2f} mm (정상 12.5)"
-            )
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
-        return torch.zeros_like(time_out), time_out
+        xy, yaw, upright, z = self.cubes_2d()
+        t0 = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.success = self.grasp_axes_clear(xy, yaw, t0).any(-1) & upright[:, 0] & (z[:, 0] < self.cfg.stacked_z)
+        self.failed = ~upright[:, 0] | (z > self.cfg.stacked_z).any(-1)
+        self.success &= ~self.failed
+        time_out = self.push_count >= self.cfg.max_pushes  # 최대 횟수만큼 밀었으면 끝
+        return self.success | self.failed, time_out
 
     # ------------------------------------------------------------------ 리셋: 큐브 무작위 배치
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -80,6 +198,8 @@ class Fr5PushEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
         n = len(env_ids)
         k = self.cubes.num_objects  # 18
+
+        self.push_count[env_ids] = 0
 
         # 그리퍼: 대기 자세로
         jp = self.robot.data.default_joint_pos[env_ids]

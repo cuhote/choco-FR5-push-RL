@@ -63,7 +63,7 @@ GRIPPER_CFG = ArticulationCfg(
         "gantry": ImplicitActuatorCfg(
             joint_names_expr=["px", "py", "pz"], effort_limit_sim=200.0, stiffness=5000.0, damping=300.0
         ),
-        "yaw": ImplicitActuatorCfg(joint_names_expr=["yaw"], effort_limit_sim=50.0, stiffness=50.0, damping=5.0),
+        "yaw": ImplicitActuatorCfg(joint_names_expr=["yaw"], effort_limit_sim=50.0, stiffness=500.0, damping=20.0),
         "fingers": ImplicitActuatorCfg(
             joint_names_expr=["finger_.*"], effort_limit_sim=100.0, stiffness=2000.0, damping=100.0
         ),
@@ -71,16 +71,38 @@ GRIPPER_CFG = ArticulationCfg(
 )
 
 
+# 밀기 1회 시간표 (초): 내려가기 -> 밀기 -> 들기 -> 안정 대기
+SIM_DT = 1 / 120
+T_DESCEND, T_PUSH, T_LIFT, T_SETTLE = 0.4, 1.6, 0.4, 0.4
+PUSH_STEPS = round((T_DESCEND + T_PUSH + T_LIFT + T_SETTLE) / SIM_DT)  # 336 물리 스텝 = 행동 1번
+MAX_PUSHES = 2  # 에피소드당 최대 밀기 횟수
+
+
 @configclass
 class Fr5PushEnvCfg(DirectRLEnvCfg):
-    # env (C단계: 장면 확인용. E단계에서 바꿈)
-    decimation = 2
-    episode_length_s = 3.0  # 3초마다 새 배치로 리셋 -> 여러 배치를 눈으로 확인
-    action_space = 4  # (dx, dy, 방향, 거리) - E단계에서 사용
-    observation_space = 3  # 임시: 대상 큐브 위치
+    # env: 행동 1번 = 밀기 1회 (물리 336스텝 = 2.8초)
+    decimation = PUSH_STEPS
+    episode_length_s = (MAX_PUSHES + 1) * PUSH_STEPS * SIM_DT  # 여유. 실제 종료는 max_pushes 로 판단
+    max_pushes = MAX_PUSHES
+    action_space = 4  # [-1,1]: 시작점 dx, dy (대상 기준), 방향, 거리
+    observation_space = 3  # 임시: 대상 큐브 위치 (E단계에서 바꿈)
     state_space = 0
 
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
+    # render_interval 4: 화면을 켰을 때 미는 동작이 보이도록 (학습은 headless라 영향 없음)
+    sim: SimulationCfg = SimulationCfg(dt=SIM_DT, render_interval=4)
+
+    # 밀기 동작
+    t_descend, t_push, t_lift = T_DESCEND, T_PUSH, T_LIFT
+    tcp_offset = TCP_OFFSET  # 플랜지 -> 손가락 끝 (pz = 손가락 끝 높이 + 0.160)
+    safe_tip_z = 0.035  # 이동할 때 손가락 끝 높이 (큐브 윗면 25mm + 10mm)
+    push_tip_z = 0.017  # 밀 때 손가락 끝 높이 (설계 16~18mm)
+    push_speed = 0.025  # 2.5 cm/s
+    push_dist_range = (0.01, 0.04)  # 1~4 cm
+    start_range = 0.08  # 시작점: 대상 중심 기준 ±80mm
+    # 실패 판정
+    landed_tol = 0.003  # 내려간 뒤 손가락 끝이 목표보다 3mm 넘게 높음 = 큐브 위에 내려앉음
+    tilt_fail_deg = 15.0  # 큐브가 15° 넘게 기울어 있음 (모서리로 서거나 다른 큐브에 기댐)
+    stacked_z = CUBE / 2 + 0.004  # 큐브 중심이 16.5mm보다 높음 = 다른 큐브 위에 올라감
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=16, env_spacing=0.6, replicate_physics=True)
 
     robot_cfg: ArticulationCfg = GRIPPER_CFG
@@ -102,4 +124,3 @@ class Fr5PushEnvCfg(DirectRLEnvCfg):
     finger_clear_width = 0.022  # 손가락 폭 20 + 여유 2 (손가락 Y 폭 실측 후 수정)
     housing_half = (0.0275, 0.020)  # 하우징 반 크기 (잡기 축 방향, 직각 방향) - 벽 충돌 검사
 
-    debug_print = True  # 큐브 최대 속도 출력 (떨림 확인용)
