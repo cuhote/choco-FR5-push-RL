@@ -13,6 +13,8 @@ parser.add_argument("--topk", type=int, default=8)
 parser.add_argument("--clear_depth", type=float, default=None)
 parser.add_argument("--wall", type=float, default=None, help="트레이 벽 높이 (m)")
 parser.add_argument("--dists", type=str, default=None, help="예: 0.055,0.040,0.030")
+parser.add_argument("--no_wall", action="store_true", help="벽 근처 대상 후보(벽 맞추기·벽 따라 밀기) 끄기")
+parser.add_argument("--angles", type=str, default=None, help="이웃 미는 방향(도) 예: 0,22.5,45,67.5,90")
 args = parser.parse_args()
 app = AppLauncher(headless=True).app
 
@@ -23,6 +25,7 @@ from fr5_push.tasks.direct.fr5_push.fr5_push_env_cfg import Fr5PushEnvCfg  # noq
 
 cfg = Fr5PushEnvCfg()
 cfg.scene.num_envs = args.num_envs
+cfg.seed = 0  # 설정을 바꿔도 같은 배치로 비교
 cfg.camera_bottom_above_tip = 0.070  # 권장 장착 가정
 cfg.obs_pos_noise_std = 0.0
 cfg.obs_yaw_noise_deg = 0.0
@@ -32,6 +35,11 @@ if args.clear_depth is not None:
     cfg.finger_clear_depth = args.clear_depth
 if args.dists is not None:
     cfg.cand_dists = tuple(float(v) for v in args.dists.split(","))
+if args.no_wall:
+    cfg.cand_wall = False
+if args.angles is not None:
+    cfg.cand_angles = tuple(float(v) for v in args.angles.split(","))
+print(f"[look] angles={cfg.cand_angles} wall_cands={cfg.cand_wall}")
 print(f"[look] wall={cfg.tray_wall_height} clear_depth={cfg.finger_clear_depth} dists={cfg.cand_dists}")
 env = Fr5PushEnv(cfg)
 env.reset()
@@ -66,23 +74,23 @@ with torch.inference_mode():
     o3 = o1.clone()
     C = c1["valid"].shape[1]
     # 1번째 후보 중 진전 상위 K 개
-    prog1 = torch.stack([progress(c1["xy_pred"][:, i], yaw) for i in range(C)], 1)
+    prog1 = torch.stack([progress(c1["xy_pred"][:, i], c1["yaw_pred"][:, i]) for i in range(C)], 1)
     prog1[~c1["valid"]] = 1e9
     top1 = prog1.topk(args.topk, dim=1, largest=False).indices
     ar = torch.arange(n, device=env.device)
     for a in range(args.topk):
         i = top1[:, a]
         ok_i = c1["valid"][ar, i]
-        xy1 = c1["xy_pred"][ar, i]
-        o2_i, c2 = opens_any(xy1, yaw)
+        xy1, yaw1 = c1["xy_pred"][ar, i], c1["yaw_pred"][ar, i]
+        o2_i, c2 = opens_any(xy1, yaw1)
         o2 |= o2_i & ok_i
-        prog2 = torch.stack([progress(c2["xy_pred"][:, q], yaw) for q in range(C)], 1)
+        prog2 = torch.stack([progress(c2["xy_pred"][:, q], c2["yaw_pred"][:, q]) for q in range(C)], 1)
         prog2[~c2["valid"]] = 1e9
         top2 = prog2.topk(args.topk, dim=1, largest=False).indices
         for b in range(args.topk):
             q = top2[:, b]
             ok_q = c2["valid"][ar, q] & ok_i
-            o3_q, _ = opens_any(c2["xy_pred"][ar, q], yaw)
+            o3_q, _ = opens_any(c2["xy_pred"][ar, q], c2["yaw_pred"][ar, q])
             o3 |= o3_q & ok_q
         o3 |= o2
         if False: print(f"[look] 첫 수 {a + 1}/{args.topk} 탐색 중... 2수 {o2.float().mean()*100:.1f}% 3수 {o3.float().mean()*100:.1f}%")
@@ -98,6 +106,12 @@ far = torch.full_like(xy, 10.0); far[:, 0] = xy[:, 0]
 wall_axes = env.grasp_axes_clear(far, yaw, zero)  # 이웃이 없을 때 축별로 열리나 (벽만 고려)
 wall_one_axis = wall_axes.sum(-1) == 1
 wall_none = wall_axes.sum(-1) == 0
+# 진짜 모서리: 두 벽(x쪽, y쪽) 모두 대상 앞 끝까지 손가락 영역보다 가까움
+ex_t = (0.0125 * (torch.cos(th).abs() + torch.sin(th).abs()))
+gx = hx - c[:, 0].abs() - ex_t
+gy = hy - c[:, 1].abs() - ex_t
+corner = (gx < cfg.finger_clear_depth) & (gy < cfg.finger_clear_depth)
+print(f"[why]   두 벽에 다 가까움(모서리):                  {(fail & corner).float().sum()/fail.sum().clamp(min=1)*100:.0f}%  (전체 중 {corner.float().mean()*100:.0f}%)")
 nb = (torch.linalg.norm(xy[:, 1:] - c[:, None], dim=-1) < 0.045).sum(-1)
 print(f"\n[why] 못 푼 경우 {fail.sum().item()}개 / 전체 {n}")
 print(f"[why]   벽 때문에 한 축은 원래 불가능 (남은 한 축만 가능): {(fail & wall_one_axis).float().sum()/fail.sum()*100:.0f}%  (전체 중 이런 배치 {wall_one_axis.float().mean()*100:.0f}%)")
@@ -108,6 +122,7 @@ for q in range(5):
 print(f"\n===== 처음 배치 {n}개: 기하 예측으로 열 수 있는 비율 =====")
 print(f"  1번 밀기로      {o1.float().mean()*100:5.1f} %")
 print(f"  2번 조합으로    {o2.float().mean()*100:5.1f} %")
+print(f"  후보 수 {C}개")
 print(f"  3번 조합으로    {o3.float().mean()*100:5.1f} %   (탐색: 매 단계 진전 상위 {args.topk}개)")
 env.close()
 app.close()

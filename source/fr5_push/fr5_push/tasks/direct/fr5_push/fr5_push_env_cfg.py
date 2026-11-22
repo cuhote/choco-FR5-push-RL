@@ -94,8 +94,15 @@ MAX_PUSHES = 3  # 대상 하나당 최대 밀기 횟수 (2번 58.8% / 3번 64.7%
 CAND_NEIGHBOURS = 6  # 후보: 가까운 이웃 6개
 CAND_DISTS = (0.040, 0.030)  # 후보: 미는 거리 2종 (앞쪽을 규칙이 우선)
 CAND_TARGET = True  # 후보: 대상 자체를 네 면 방향으로 밀기
-# 이웃 6 x 옆면 2 x 방향 2(옆으로 / 45° 바깥) x 거리 2 = 48, 대상 4면 x 거리 2 = 8 -> 56
-NUM_CAND = CAND_NEIGHBOURS * 2 * 2 * len(CAND_DISTS) + (4 * len(CAND_DISTS) if CAND_TARGET else 0)
+CAND_ANGLES = (0.0, 22.5, 45.0, 67.5, 90.0)  # 이웃 미는 방향: 0 = 옆으로 비키기, 90 = 대상 반대쪽으로 곧게 (사이 각도는 섞음)
+# 이웃 6 x 옆면 2 x 방향 5 x 거리 2 = 120, 대상 4면 x 거리 2 = 8 -> 128
+# (방향 2가지(0°, 45°) 56개일 때 상한 85.4% -> 5가지 89.3%, lookahead_check 512 배치)
+CAND_WALL = True  # 후보: 벽 근처 대상을 벽에 맞추기(벽 4개 x 1) + 벽 따라 밀기(벽 4개 x 양쪽 x 거리)
+NUM_CAND = (
+    CAND_NEIGHBOURS * 2 * len(CAND_ANGLES) * len(CAND_DISTS)
+    + (4 * len(CAND_DISTS) if CAND_TARGET else 0)
+    + (4 * (1 + 2 * len(CAND_DISTS)) if CAND_WALL else 0)
+)
 
 
 @configclass
@@ -104,8 +111,8 @@ class Fr5PushEnvCfg(DirectRLEnvCfg):
     decimation = PUSH_STEPS
     episode_length_s = (MAX_PUSHES + 1) * PUSH_STEPS * SIM_DT  # 여유. 실제 종료는 max_pushes 로 판단
     max_pushes = MAX_PUSHES
-    action_space = NUM_CAND  # 후보 56개 각각의 점수 -> 안전한 후보 중 최고점을 실행
-    observation_space = 51 + NUM_CAND * 10  # 611: 대상 주변 51 + 후보 56 x 10
+    action_space = NUM_CAND  # 후보 128개 각각의 점수 -> 안전한 후보 중 최고점을 실행
+    observation_space = 51 + NUM_CAND * (10 + 2)  # 1587: 대상 주변 51 + 후보 128 x (10 + 탐색 정보 2)
     state_space = 0
 
     # render_interval 4: 화면을 켰을 때 미는 동작이 보이도록 (학습은 headless라 영향 없음)
@@ -122,6 +129,11 @@ class Fr5PushEnvCfg(DirectRLEnvCfg):
     cand_neighbours = CAND_NEIGHBOURS
     cand_dists = CAND_DISTS
     cand_target = CAND_TARGET
+    cand_angles = CAND_ANGLES
+    cand_wall = CAND_WALL
+    cand_wall_square = False  # 벽 맞추기 후보 사용 여부 (면 법선 밀기: 예측 열림 94% vs 실제 5% -> 꺼 둠)
+    wall_square_mode = "normal"  # "normal" 벽과 직각으로 밀기 / "face" 큐브 면 법선으로 밀기
+    wall_stop_gap = 0.002  # 벽 맞추기: 큐브가 벽에 닿기 2mm 전에 그리퍼 멈춤 (벽에 큐브를 눌러 끼우지 않게)
     safety_margin = 0.004  # 안전 필터 여유: 착지 자리·하우징 검사 면적을 4mm 넓혀 검사 (카메라 오차 대비)
     start_clearance = 0.008  # 후보: 밀 큐브 옆면에서 8mm 떨어져 내림 (안전 여유 4mm보다 크게)
     # 실패 판정
@@ -171,6 +183,8 @@ class Fr5PushEnvCfg(DirectRLEnvCfg):
     finger_gains = {"push": (2000.0, 100.0, 100.0), "grasp": (200.0, 20.0, 5.0)}
     grasp_open_each = 0.0195  # 잡기 전 벌림: 손가락마다 19.5mm (약 89%, 합 39mm). 70% 면 카메라 오차에 약함
     grasp_ok_range = (0.0123, 0.0132)  # 잡기 성공 위치값 56~60% (손가락마다, 실물 메모 기준)
+    obs_lookahead = True  # 후보마다 탐색 정보(모자란 깊이, 다음 수에 열림)를 관측에 추가 (False 면 관측 611)
+    lookahead_topk = 6  # 다음 수를 펼쳐 볼 후보 수 (탐색 규칙과 같음)
     do_grasp = True  # 밀기 후 "열림" 판정이면 실제로 잡아서 들기. 성공 = 실제로 들림 (False 면 성공 = 한 축 열림)
 
     # 카메라 측정 노이즈 (D435 흉내). 계획(관측·후보·안전 검사)에만 적용, 물리·성공 판정은 참값

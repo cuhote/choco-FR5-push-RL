@@ -155,7 +155,7 @@ class Fr5PushEnv(DirectRLEnv):
           valid : 이웃이 obs_neighbour_radius 안 + 착지 자리·하우징이 안전 여유(safety_margin)까지 비어 있음
           opens : 민 큐브를 민 만큼 옮긴 배치에서 대상이 열리는지 (기하 예측. 실제 물리와 다를 수 있음)
           chain : 옮긴 큐브가 다른 큐브·벽과 겹침 = 줄줄이 밀림 (예측이 덜 정확)
-          xy_pred: 밀고 난 뒤 예상 배치 (n, k, 2) - 앞을 내다보는 탐색용
+          xy_pred, yaw_pred: 밀고 난 뒤 예상 배치 (n, k, 2), (n, k) - 앞을 내다보는 탐색용
           feat  : 후보마다 10개 (대상 좌표계) = 시작점 x',y' /0.1, 미는 방향 sin/cos, 거리 /0.04,
                   밀 큐브 위치 x',y' /0.1, opens, chain, valid.  valid=0 이면 전부 0
         """
@@ -168,44 +168,52 @@ class Fr5PushEnv(DirectRLEnv):
         dn = torch.linalg.norm(xy[:, 1:] - c[:, None], dim=-1)
         order = dn.argsort(dim=1)[:, : cfg.cand_neighbours]
 
-        out = {key: [] for key in ("start", "theta", "dist", "valid", "opens", "feat", "xy_pred")}
+        out = {key: [] for key in ("start", "theta", "dist", "valid", "opens", "feat", "xy_pred", "yaw_pred")}
+        hx, hy = cfg.tray_inner_half
 
-        def add(j, pj, yj, u, near_ok):
-            """큐브 j 를 u 방향으로 미는 후보 (거리별로 추가)."""
+        def add_one(j, pj, yj, u, ok, dist, new_p, new_yaw, strict=False):
+            """큐브 j 를 u 방향으로 dist (n,) 만큼 미는 후보 1개. 결과 예상: j 가 new_p, new_yaw 로 감.
+            strict: 옮긴 큐브가 다른 큐브와 겹치면 아예 무효 (벽에 밀어 넣는 후보: 꽉 끼면 그리퍼가 누름)."""
             th = torch.atan2(u[:, 1], u[:, 0])
             gap = _extent(yj, (h, h), th) + cfg.finger_foot_half[0] + cfg.start_clearance
             start = pj - u * gap[:, None]  # 밀 큐브의 반대쪽 빈 바닥
             not_j = torch.ones(n, k, dtype=torch.bool, device=self.device)
             not_j[ar, j] = False
-            for dist in cfg.cand_dists:
-                ok = near_ok & self.landing_free(start, start + u * dist, th, xy, yaw, cfg.safety_margin)
-                xy_pred = xy.clone()
-                xy_pred[ar, j] = pj + u * (dist - cfg.start_clearance)  # 밀고 난 뒤 예상 위치
-                # 밀린 큐브가 다른 큐브·벽과 부딪힘(줄줄이 밀림) -> 예측이 덜 정확함. 정책이 보도록 특징으로 넣음
-                chain = (_overlap_matrix(xy_pred[ar, j][:, None], yj[:, None], (h, h), xy_pred, yaw)[:, 0] & not_j).any(-1)
-                chain |= ~_rect_inside_tray(xy_pred[ar, j], yj, (h, h), hx, hy)
-                opens = self.grasp_axes_clear(xy_pred, yaw, zero).any(-1)
-                rel = th - th_t
-                feat = torch.cat(
-                    [
-                        _rotate(start - c, -th_t) / 0.1,
-                        torch.sin(rel)[:, None],
-                        torch.cos(rel)[:, None],
-                        torch.full((n, 1), dist / 0.04, device=self.device),
-                        _rotate(pj - c, -th_t) / 0.1,
-                        opens.float()[:, None],
-                        chain.float()[:, None],
-                        ok.float()[:, None],
-                    ],
-                    dim=-1,
-                ) * ok.float()[:, None]
-                vals = (("start", start), ("theta", th), ("dist", torch.full((n,), dist, device=self.device)),
-                        ("valid", ok), ("opens", opens), ("feat", feat), ("xy_pred", xy_pred))
-                for key, val in vals:
-                    out[key].append(val)
+            ok = ok & self.landing_free(start, start + u * dist[:, None], th, xy, yaw, cfg.safety_margin)
+            xy_pred, yaw_pred = xy.clone(), yaw.clone()
+            xy_pred[ar, j], yaw_pred[ar, j] = new_p, new_yaw
+            # 밀린 큐브가 다른 큐브·벽과 부딪힘(줄줄이 밀림) -> 예측이 덜 정확함. 정책이 보도록 특징으로 넣음
+            hit = (_overlap_matrix(new_p[:, None], new_yaw[:, None], (h, h), xy_pred, yaw_pred)[:, 0] & not_j).any(-1)
+            if strict:
+                ok = ok & ~hit
+            chain = hit | ~_rect_inside_tray(new_p, new_yaw, (h, h), hx, hy)
+            opens = self.grasp_axes_clear(xy_pred, yaw_pred, zero).any(-1)
+            rel = th - th_t
+            feat = torch.cat(
+                [
+                    _rotate(start - c, -th_t) / 0.1,
+                    torch.sin(rel)[:, None],
+                    torch.cos(rel)[:, None],
+                    (dist / 0.04)[:, None],
+                    _rotate(pj - c, -th_t) / 0.1,
+                    opens.float()[:, None],
+                    chain.float()[:, None],
+                    ok.float()[:, None],
+                ],
+                dim=-1,
+            ) * ok.float()[:, None]
+            vals = (("start", start), ("theta", th), ("dist", dist), ("valid", ok), ("opens", opens),
+                    ("feat", feat), ("xy_pred", xy_pred), ("yaw_pred", yaw_pred))
+            for key, val in vals:
+                out[key].append(val)
 
-        hx, hy = cfg.tray_inner_half
-        # (1) 이웃 밀기: 가까운 이웃 순서대로, 양쪽 옆면 x (옆으로 비켜나기, 대각선으로 멀어지기)
+        def add(j, pj, yj, u, near_ok):
+            """큐브 j 를 u 방향으로 미는 후보 (거리별로 추가). 결과 예상 = 회전 없이 밀린 만큼 이동."""
+            for dist in cfg.cand_dists:
+                d = torch.full((n,), dist, device=self.device)
+                add_one(j, pj, yj, u, near_ok, d, pj + u * (dist - cfg.start_clearance), yj)
+
+        # (1) 이웃 밀기: 가까운 이웃 순서대로, 양쪽 옆면 x 방향 (0° 옆으로 비키기 ~ 90° 대상 반대쪽으로)
         for rank in range(cfg.cand_neighbours):
             j = order[:, rank] + 1  # 큐브 인덱스 (0 = 대상)
             pj, yj = xy[ar, j], yaw[ar, j]
@@ -213,15 +221,54 @@ class Fr5PushEnv(DirectRLEnv):
             v = (pj - c) / dn[ar, j - 1, None].clamp(min=1e-6)  # 대상 -> 이웃
             for sgn in (1.0, -1.0):
                 w = sgn * torch.stack([-v[:, 1], v[:, 0]], dim=-1)  # 직각
-                for u in (w, (w + v) / math.sqrt(2.0)):  # 옆으로 / 45° 바깥으로
-                    add(j, pj, yj, u, near_ok)
+                for a_deg in cfg.cand_angles:  # 0° = 옆으로 비키기, 90° = 대상 반대쪽으로 곧게
+                    a = math.radians(a_deg)
+                    add(j, pj, yj, math.cos(a) * w + math.sin(a) * v, near_ok)
         # (2) 대상 밀기: 대상의 네 면 방향
+        ones = torch.ones(n, dtype=torch.bool, device=self.device)
         if cfg.cand_target:
-            ones = torch.ones(n, dtype=torch.bool, device=self.device)
             for q in range(4):
                 ang = th_t + q * math.pi / 2
                 u = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)
                 add(zero, c, yaw[:, 0], u, ones)
+        # (3) 벽 근처 대상: 벽마다 (가까울 때만 유효)
+        #   벽 맞추기: 벽 쪽으로 밀어 벽에 붙이며 벽과 나란히 세움 (회전 예측). 벽에서 2mm 앞에서 멈춤
+        #   벽 따라 밀기: 벽과 나란히 양쪽으로 cand_dists 만큼
+        if cfg.cand_wall:
+            yt = yaw[:, 0]
+            for wall_ang, W in ((0.0, hx), (math.pi, hx), (math.pi / 2, hy), (-math.pi / 2, hy)):
+                nw = torch.tensor([math.cos(wall_ang), math.sin(wall_ang)], device=self.device).expand(n, 2)
+                cn = (c * nw).sum(-1)  # 벽 방향 좌표
+                ext = _extent(yt, (h, h), torch.full_like(yt, wall_ang))
+                gap_w = W - cn - ext  # 대상 앞 끝 ~ 벽
+                near_w = gap_w < cfg.finger_clear_depth + cfg.safety_margin
+                # 벽 맞추기: 대상을 벽 쪽으로 밀어 벽에 붙이며 벽과 나란히 세움 (회전 예측). 벽에서 stop 앞에서 멈춤
+                #   wall_square_mode "normal": 벽과 직각으로 민다 (손가락 바닥이 벽과 나란 -> 붙은 큐브 뒤 면까지 감)
+                #   "face": 벽에 가까운 면의 법선으로 민다 (기운 손가락 모서리가 먼저 멈춰 큐브가 벽까지 못 감)
+                d = _wrap90(yt - wall_ang)  # 큐브가 벽과 어긋난 각 [-45°, 45°)
+                stop = cfg.wall_stop_gap
+                foot = cfg.finger_foot_half[0]
+                tw = torch.stack([-nw[:, 1], nw[:, 0]], dim=-1)  # 벽 따라 방향
+                travel_n = W - h - stop / 2 - cn
+                if cfg.wall_square_mode == "normal":
+                    u = nw
+                    dist = W - cn - 2 * h - stop + ext + cfg.start_clearance
+                    new_p = c + nw * travel_n[:, None]
+                else:
+                    cd, sd = torch.cos(d), torch.sin(d)
+                    u = nw * cd[:, None] + tw * sd[:, None]
+                    start_n = cn - (h + foot + cfg.start_clearance) * cd
+                    dist = (W - 2 * h - stop - foot * (cd.abs() + sd.abs()) - start_n) / cd
+                    new_p = c + nw * travel_n[:, None] + tw * (travel_n * torch.tan(d))[:, None]
+                ok = near_w & (dist > cfg.start_clearance) & (dist <= cfg.t_push * cfg.push_speed)
+                ok &= cfg.cand_wall_square
+                add_one(zero, c, yt, u, ok, dist.clamp(min=0.0), new_p, yt - d, strict=True)
+                # 벽 따라 밀기
+                for sgn in (1.0, -1.0):
+                    t = sgn * torch.stack([-nw[:, 1], nw[:, 0]], dim=-1)
+                    for dd in cfg.cand_dists:
+                        d = torch.full((n,), dd, device=self.device)
+                        add_one(zero, c, yt, t, near_w, d, c + t * (dd - cfg.start_clearance), yt)
         return {key: torch.stack(val, dim=1) for key, val in out.items()}
 
     def landing_free(self, start, end, theta, xy, yaw, margin: float = 0.0) -> torch.Tensor:
@@ -365,18 +412,30 @@ class Fr5PushEnv(DirectRLEnv):
         stuck = ~(valid & opens).any(-1)
         if not stuck.any():
             return score
-        yaw = self._obs_yaw
+        if "deficit" not in cand:  # 관측에서 이미 계산했으면 재사용
+            cand["deficit"], cand["next_open"] = self.lookahead_info(cand, self._obs_yaw, topk)
+        score2 = 1.0 * cand["next_open"].float() - 10.0 * cand["deficit"] + order_bonus
+        return torch.where(stuck[:, None], score2, score)
+
+    def lookahead_info(self, cand: dict, yaw: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """후보마다 (밀고 난 뒤 열리기까지 모자란 깊이 (n,C) m, 다음 수에 "열림 예측" 후보가 생기나 (n,C) bool).
+
+        다음 수 계산은 무거워서, 모자란 깊이가 가장 작은 안전한 후보 topk 개만 펼친다 (나머지는 False).
+        """
+        valid = cand["valid"]
+        n, num = valid.shape
         ar = torch.arange(n, device=self.device)
-        deficit = torch.stack([self.open_deficit(cand["xy_pred"][:, i], yaw) for i in range(num)], dim=1)
-        deficit[~valid] = 1.0
+        deficit = torch.stack(
+            [self.open_deficit(cand["xy_pred"][:, i], cand["yaw_pred"][:, i]) for i in range(num)], dim=1
+        )
+        deficit = torch.where(valid, deficit, torch.full_like(deficit, self.cfg.finger_clear_depth * 2))
         top = deficit.topk(min(topk, num), dim=1, largest=False).indices
         next_open = torch.zeros(n, num, dtype=torch.bool, device=self.device)
         for r in range(top.shape[1]):
             i = top[:, r]
-            c2 = self.build_candidates(cand["xy_pred"][ar, i], yaw)
+            c2 = self.build_candidates(cand["xy_pred"][ar, i], cand["yaw_pred"][ar, i])
             next_open[ar, i] = (c2["valid"] & c2["opens"]).any(-1) & valid[ar, i]
-        score2 = 1.0 * next_open.float() - 10.0 * deficit + order_bonus
-        return torch.where(stuck[:, None], score2, score)
+        return deficit, next_open
 
     def open_deficit(self, xy: torch.Tensor, yaw: torch.Tensor, steps: int = 8) -> torch.Tensor:
         """대상이 열리기까지 모자란 빈 깊이 (n,) m. 두 축 중 나은 쪽의 (양쪽 면 부족분 합). 0 = 열림."""
@@ -394,14 +453,14 @@ class Fr5PushEnv(DirectRLEnv):
 
     # ------------------------------------------------------------------ 관측/보상/종료
     def _get_observations(self) -> dict:
-        """대상 큐브 좌표계로 표현한 관측 (51 + 후보 56 x 10 = 611개).
+        """대상 큐브 좌표계로 표현한 관측 (51 + 후보 NUM_CAND x 12; 지금 148개 -> 1827).
 
         [0:2]   대상 yaw (트레이 기준) sin/cos(4θ)  - 정사각형이라 90° 주기
         [2:6]   대상 중심에서 +x', -x', +y', -y' 방향으로 벽까지 거리 / 0.1m
         [6:10]  손가락 영역 4곳(+x', -x', +y', -y')이 비었는지 (1 = 빔)
         [10:50] 가까운 이웃 8개 x (상대 x', y' / 0.1m, sin/cos(4Δθ), 있음 여부)
         [50]    민 횟수 / 최대 횟수
-        [51:]   밀기 후보 56개 x 10 (build_candidates 참고). 행동 i = 후보 i 의 점수
+        [51:]   밀기 후보 x (특징 10 + 탐색 정보 2) (build_candidates, lookahead_info 참고). 행동 i = 후보 i 의 점수
         """
         cfg = self.cfg
         xy, yaw = self.cubes_observed()  # 카메라로 본 위치 (측정 노이즈 포함). 관측·후보·안전 검사 모두 이 값 사용
@@ -431,7 +490,16 @@ class Fr5PushEnv(DirectRLEnv):
         count = (self.push_count.float() / cfg.max_pushes)[:, None]
         self._obs_xy, self._obs_yaw = xy, yaw
         self._cand = self.build_candidates(xy, yaw)  # 다음 행동은 이 후보 중에서 고름
-        obs = torch.cat([target_yaw, walls, sides, nb.reshape(n, -1), count, self._cand["feat"].reshape(n, -1)], dim=-1)
+        feat = self._cand["feat"]
+        if cfg.obs_lookahead:
+            # 탐색 규칙이 쓰는 정보를 RL 에도: 후보마다 (모자란 깊이, 다음 수에 열리는 후보가 생기나)
+            self._cand["deficit"], self._cand["next_open"] = self.lookahead_info(self._cand, yaw, cfg.lookahead_topk)
+            v = self._cand["valid"].float()[..., None]
+            extra = torch.stack(
+                [self._cand["deficit"] / cfg.finger_clear_depth, self._cand["next_open"].float()], dim=-1
+            )
+            feat = torch.cat([feat, extra * v], dim=-1)
+        obs = torch.cat([target_yaw, walls, sides, nb.reshape(n, -1), count, feat.reshape(n, -1)], dim=-1)
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
