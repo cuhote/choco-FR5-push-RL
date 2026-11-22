@@ -1,7 +1,8 @@
-"""D단계: 학습 없이 규칙대로 밀어 보기.
+"""학습 없이 규칙대로 밀어 보기 (화면 확인용).
 
-규칙(demo): 대상에 가장 가까운 이웃을 대상-이웃 선과 직각 방향으로 35mm 밀어 비켜나게 한다.
-비교(random): 무작위 행동.
+규칙(demo): 안전한 후보 중 "밀면 대상이 열린다"고 예측되는 것을 가까운 이웃부터 고른다.
+탐색(look): 바로 열리는 후보가 없으면 두 수 앞을 내다보고 고른다.
+비교(random): 안전한 후보 중 무작위.
 
 사용:
   python scripts/push_demo.py --num_envs 4                       # 화면으로 보기
@@ -16,7 +17,7 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="FR5 push demo (rule-based)")
 parser.add_argument("--num_envs", type=int, default=4)
 parser.add_argument("--task", type=str, default="Template-Fr5-Push-Direct-v0")
-parser.add_argument("--policy", type=str, default="demo", choices=["demo", "random"])
+parser.add_argument("--policy", type=str, default="demo", choices=["demo", "look", "random"])
 parser.add_argument("--pushes", type=int, default=0, help="밀기 횟수 (0 = 창을 닫을 때까지)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -43,8 +44,10 @@ def main():
         with torch.inference_mode():
             if args_cli.policy == "demo":
                 actions = u.demo_push_action()
+            elif args_cli.policy == "look":
+                actions = u.demo_push_action(lookahead=True)
             else:
-                actions = torch.rand(u.num_envs, 4, device=u.device) * 2 - 1
+                actions = torch.rand(u.num_envs, u.cfg.action_space, device=u.device)
             first = u.push_count == 0
             _, _, terminated, truncated, _ = env.step(actions)
             done = terminated | truncated
