@@ -36,6 +36,11 @@ class Fr5PushEnv(DirectRLEnv):
         self.chosen = torch.zeros(n, dtype=torch.long, device=self.device)
         self.chosen_opens = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.success = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.axis_open = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.grasp_tried = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.grasp_ok = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.fail_tilt = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.fail_stack = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.failed = torch.zeros(n, dtype=torch.bool, device=self.device)
 
     # ------------------------------------------------------------------ 장면
@@ -282,25 +287,33 @@ class Fr5PushEnv(DirectRLEnv):
         return xy, yaw
 
     # ------------------------------------------------------------------ 잡기 (검증용: 실제로 집어서 들어 보기)
-    def grasp_attempt(self, center: torch.Tensor, axis_angle: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def grasp_attempt(
+        self, center: torch.Tensor, axis_angle: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """center (n,2) 에서 axis_angle 방향으로 손가락을 벌려 잡고 들어 본다. env.step 밖에서 물리를 직접 돌림.
 
-        순서: 손가락 70% 벌림 -> 잡기 높이로 내려감 -> 닫음 -> 위치값 검사 -> 60mm 들기
+        순서: 손가락 벌림(grasp_open_each) -> 잡기 높이로 내려감 -> 닫음 -> 위치값 검사 -> 60mm 들기
+        mask: 잡기를 실행할 환경 (None = 전부). 나머지 환경의 그리퍼는 지금 자세로 기다림.
         반환: (위치값이 성공 범위 56~60% 인지, 큐브가 30mm 이상 들렸는지) 각 (n,) bool. 대상 = 0번 큐브.
         """
         cfg = self.cfg
         dt = self.physics_dt
+        n = self.num_envs
+        m = torch.ones(n, dtype=torch.bool, device=self.device) if mask is None else mask
+        hold = self.robot.data.joint_pos.clone()
         self.set_finger_mode("grasp")
-        self._yaw = torch.remainder(axis_angle + math.pi / 2, math.pi) - math.pi / 2  # 그리퍼 X(벌림) = 잡기 축
+        yaw_g = torch.remainder(axis_angle + math.pi / 2, math.pi) - math.pi / 2  # 그리퍼 X(벌림) = 잡기 축
+        self._yaw = torch.where(m, yaw_g, self._yaw)
         open_w = cfg.grasp_open_each
 
         def targets(tip, finger):
             jp = self._joint_targets(center, tip)
             jp[:, self._fingers] = finger
-            return jp
+            return torch.where(m[:, None], jp, hold)
 
         jp = targets(cfg.safe_tip_z, open_w)
-        self.robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
+        ids = m.nonzero().flatten()
+        self.robot.write_joint_state_to_sim(jp[ids], torch.zeros_like(jp[ids]), env_ids=ids)
 
         def run(seconds, fn, label=""):
             steps = max(1, round(seconds / dt))
@@ -330,7 +343,7 @@ class Fr5PushEnv(DirectRLEnv):
         run(0.3, lambda f: (g + 0.06, 0.0), "lifted")
         lifted = self.cubes.data.object_pos_w[:, 0, 2] > CUBE / 2 + 0.03
         self.last_finger_pos = fpos.clone()
-        return held, lifted
+        return held & m, lifted & m
 
     # ------------------------------------------------------------------ 규칙 (비교 기준선)
     def demo_push_action(self, lookahead: bool = False, topk: int = 6) -> torch.Tensor:
@@ -431,15 +444,36 @@ class Fr5PushEnv(DirectRLEnv):
         return r
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """밀기 1회가 끝난 뒤: 실패 확인 -> 카메라로 본 위치로 "열림" 판정 -> 열렸으면 실제로 잡아서 들기.
+
+        성공 = 실제로 들림 (do_grasp=True). 잡기에 실패하고 밀기 횟수가 남았으면 다시 보고 계속 민다.
+        """
+        cfg = self.cfg
+        n = self.num_envs
         xy, yaw, upright, z = self.cubes_2d()
-        t0 = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self.success = self.grasp_axes_clear(xy, yaw, t0).any(-1) & upright[:, 0] & (z[:, 0] < self.cfg.stacked_z)
+        t0 = torch.zeros(n, dtype=torch.long, device=self.device)
         # 실패: 대상이 기울어짐 / 큐브가 쌓임 / 그리퍼가 큐브 위에 내려앉음(실물에서는 충돌·정지)
         self.fail_tilt = ~upright[:, 0]
-        self.fail_stack = (z > self.cfg.stacked_z).any(-1)
+        self.fail_stack = (z > cfg.stacked_z).any(-1)
         self.failed = self.fail_tilt | self.fail_stack | self.landed_on_cube
-        self.success &= ~self.failed
-        time_out = self.push_count >= self.cfg.max_pushes  # 최대 횟수만큼 밀었으면 끝
+        # 참값으로 본 "한 축 열림" (분석용)
+        self.axis_open = self.grasp_axes_clear(xy, yaw, t0).any(-1) & ~self.failed
+
+        self.grasp_tried = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.grasp_ok = torch.zeros(n, dtype=torch.bool, device=self.device)
+        if cfg.do_grasp:
+            oxy, oyaw = self.cubes_observed()  # 실물처럼 카메라로 본 위치로 판정
+            clear = self.grasp_axes_clear(oxy, oyaw, t0)
+            self.grasp_tried = clear.any(-1) & ~self.failed
+            if self.grasp_tried.any():
+                axis = torch.where(clear[:, 0], 0, 1)
+                ang = _wrap90(oyaw[:, 0]) + axis * math.pi / 2
+                held, lifted = self.grasp_attempt(oxy[:, 0], ang, mask=self.grasp_tried)
+                self.grasp_ok = self.grasp_tried & held & lifted
+            self.success = self.grasp_ok
+        else:
+            self.success = self.axis_open
+        time_out = self.push_count >= cfg.max_pushes  # 최대 횟수만큼 밀었으면 끝
         return self.success | self.failed, time_out
 
     # ------------------------------------------------------------------ 리셋: 큐브 무작위 배치
@@ -456,6 +490,7 @@ class Fr5PushEnv(DirectRLEnv):
                 "success_rate": self.success[env_ids].float().mean().item(),
                 "fail_rate": self.failed[env_ids].float().mean().item(),
                 "landed_rate": self.landed_on_cube[env_ids].float().mean().item(),
+                "grasp_tried": self.grasp_tried[env_ids].float().mean().item(),
                 "no_candidate_rate": self._skip[env_ids].float().mean().item(),
                 "chosen_predicted_open": self.chosen_opens[env_ids].float().mean().item(),
                 "pushes_used": self.push_count[env_ids].float().mean().item(),

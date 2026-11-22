@@ -72,6 +72,7 @@ def main(env_cfg, agent_cfg):
     ep = succ = fail = landed = pushes = skipped = pred_open = 0
     succ_at = {}
     po_n = po_s = f_tilt = f_stack = 0
+    g_try = g_ok = g_axis_true = 0
     for _ in range(args_cli.pushes):
         with torch.inference_mode():
             if args_cli.policy == "rl":
@@ -97,16 +98,22 @@ def main(env_cfg, agent_cfg):
         po_n += u.chosen_opens.sum().item()
         po_s += (u.chosen_opens & u.success).sum().item()
         f_tilt += (u.fail_tilt & done).sum().item()
+        g_try += u.grasp_tried.sum().item()
+        g_ok += u.grasp_ok.sum().item()
+        g_axis_true += (u.grasp_tried & u.axis_open).sum().item()
         f_stack += (u.fail_stack & done).sum().item()
         pushes += n
 
     print(f"\n===== {args_cli.policy} : 에피소드 {ep}개, 밀기 {pushes}회 =====")
-    print(f"  성공률                    {succ / max(ep, 1) * 100:5.1f} %")
+    label = "성공률 (실제로 들어 올림)" if u.cfg.do_grasp else "성공률 (한 축 열림)"
+    print(f"  {label:24s} {succ / max(ep, 1) * 100:5.1f} %")
     print(f"  실패(넘어짐/쌓임/착지)     {fail / max(ep, 1) * 100:5.1f} %")
     print(f"  큐브 위 착지 (밀기당)      {landed / pushes * 100:5.1f} %")
     print(f"  안전한 후보 없음 (밀기당)  {skipped / pushes * 100:5.1f} %  (실물: 실행 안 함)")
     print(f"  고른 후보가 열림 예측      {pred_open / pushes * 100:5.1f} %")
-    print(f"  '열림 예측' 밀기 -> 실제로 열림  {po_s / max(po_n, 1) * 100:5.1f} %  (예측 정확도)")
+    if u.cfg.do_grasp:
+        print(f"  잡기 시도 {g_try}회 -> 들림 {g_ok / max(g_try, 1) * 100:5.1f} %   (시도 중 참값으로도 열림 {g_axis_true / max(g_try, 1) * 100:.1f} %)")
+    print(f"  '열림 예측' 밀기 -> 성공       {po_s / max(po_n, 1) * 100:5.1f} %  (예측 정확도)")
     print(f"  실패 내역: 대상 기울어짐 {f_tilt / max(ep, 1) * 100:.1f}%, 큐브 쌓임 {f_stack / max(ep, 1) * 100:.1f}%")
     acc = 0
     for c_ in sorted(succ_at):
