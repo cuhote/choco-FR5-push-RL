@@ -52,14 +52,16 @@ assets/
   usd/fr5_pgea/          FR5 + PGEA (예전 버전)
   urdf/                  USD를 만든 원본 URDF와 메시 (fairino FR5, PGEA, D435 포함 버전)
   tools/                 PGEA URDF 생성 스크립트
+source/fr5_push/fr5_push/push_geom.py   ★ 기하 계산 (후보·안전 검사·잡기 판정·관측·규칙). Isaac Sim 없이 돌고 실물(choco_ws)도 같은 코드를 씀
 source/fr5_push/fr5_push/tasks/direct/fr5_push/
-  fr5_push_env.py        환경: 배치, 후보, 안전 검사, 밀기·잡기 동작, 판정, 보상
+  fr5_push_env.py        환경: 배치, 밀기·잡기 동작, 실패 판정, 보상 (기하 계산은 push_geom 상속)
   fr5_push_env_cfg.py    설정값 (트레이, 큐브, 틈, 보상 등)
 scripts/
   cat_ppo/train_cat.py   ★ categorical PPO 학습·평가·화면 보기
   push_demo.py           규칙 기준선 (demo / look / random)
   rsl_rl/                rsl_rl 학습 (이전 방식, 비교용)
-  tools/                 분석 도구 (oracle_check: 물리 상한, lookahead_check: 기하 상한, stack_view: 쌓임 재생, make_figures)
+  tools/                 분석 도구 (oracle_check: 물리 상한, lookahead_check: 기하 상한, stack_view: 쌓임 재생, make_figures,
+                         geom_snapshot: push_geom 을 바꾼 전후로 관측이 같은지 확인 + 실물 시험용 JSON)
 docs/                    설정값·변경 내역·실험 기록·그림
 ```
 
