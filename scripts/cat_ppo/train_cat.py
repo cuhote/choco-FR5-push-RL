@@ -33,6 +33,7 @@ parser.add_argument("--eval", default=None, help="평가할 model_*.pt (탐색 �
 parser.add_argument("--pushes", type=int, default=12, help="평가: 환경마다 밀기 수")
 parser.add_argument("--eval_policy", default="cat", choices=["cat", "look", "demo"],
                     help="평가할 정책: cat = --eval 모델, look/demo = 규칙 (같은 시드 = 같은 배치로 비교)")
+parser.add_argument("--old_rules", action="store_true", help="11/26 이전 규칙으로 (모서리 배치 허용, 모서리 실패 없음)")
 parser.add_argument("--gui", action="store_true", help="평가를 화면으로 보기 (환경 수는 16 정도로)")
 args = parser.parse_args()
 app = AppLauncher(headless=not args.gui).app
@@ -90,6 +91,9 @@ def make_env(num_envs, seed):
     cfg.scene.num_envs = num_envs
     cfg.seed = seed
     cfg.residual_rule = False  # 정책이 직접 고름 (넘긴 점수 그대로 argmax)
+    if args.old_rules:  # 예전 모델과 같은 조건으로 비교할 때
+        cfg.corner_free = 0.0
+        cfg.corner_fail_after = -1
     env = Fr5PushEnv(cfg)
     obs, _ = env.reset()
     return env, obs["policy"]
@@ -164,7 +168,7 @@ def evaluate(path):
             blocked += (env.fail_blocked & done).sum().item()
             corner += (env.fail_corner & done).sum().item()
             print(f"[eval] 밀기 {i + 1}/{args.pushes}", flush=True)
-    print(f"\n===== 평가 ({args.eval_policy}): {path if args.eval_policy == 'cat' else '규칙'} | 시드 {args.seed + 1000}, 환경 {env.num_envs}개 =====")
+    print(f"\n===== 평가 ({args.eval_policy}{', 예전 규칙' if args.old_rules else ''}): {path if args.eval_policy == 'cat' else '규칙'} | 시드 {args.seed + 1000}, 환경 {env.num_envs}개 =====")
     print(f"에피소드 {ep}개 (최대 {env.cfg.max_pushes}회 밀기)")
     print(f"  성공률 (실제로 들어 올림)  {succ / max(ep, 1) * 100:5.1f} %")
     print(f"  실패(전체)                {fail / max(ep, 1) * 100:5.1f} %  (그중 시작점 막힘 {blocked / max(ep, 1) * 100:4.1f} %)")
