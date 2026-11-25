@@ -43,6 +43,9 @@ class Fr5PushEnv(DirectRLEnv):
         self.fail_stack = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.failed = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.fail_blocked = torch.zeros(n, dtype=torch.bool, device=self.device)  # 시작점 막힘 (안전한 후보 없음)
+        self.fail_corner = torch.zeros(n, dtype=torch.bool, device=self.device)  # 모서리에 낀 뒤 정해진 횟수 안에 못 듦
+        self.in_corner = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.corner_count = torch.zeros(n, dtype=torch.long, device=self.device)  # 대상이 모서리에 낀 채로 끝난 밀기 수 (연속)
         self._deficit_before = torch.zeros(n, device=self.device)  # 밀기 전 모자란 깊이 (틈 보상용)
         self._deficit_after = torch.zeros(n, device=self.device)
 
@@ -582,6 +585,11 @@ class Fr5PushEnv(DirectRLEnv):
             self.success = self.grasp_ok
         else:
             self.success = self.axis_open
+        # 모서리 규칙: 대상이 모서리에 낀 뒤 corner_fail_after 번 더 밀어도 못 들면 실패
+        self.in_corner = self.target_in_corner(xy, yaw)
+        self.corner_count = torch.where(self.in_corner, self.corner_count + 1, torch.zeros_like(self.corner_count))
+        self.fail_corner = self.in_corner & (self.corner_count > cfg.corner_fail_after) & ~self.success & (cfg.corner_fail_after >= 0)
+        self.failed = self.failed | self.fail_corner
         time_out = self.push_count >= cfg.max_pushes  # 최대 횟수만큼 밀었으면 끝
         return self.success | self.failed, time_out
 
@@ -599,12 +607,15 @@ class Fr5PushEnv(DirectRLEnv):
                 "success_rate": self.success[env_ids].float().mean().item(),
                 "fail_rate": self.failed[env_ids].float().mean().item(),
                 "blocked_rate": self.fail_blocked[env_ids].float().mean().item(),
+                "corner_fail_rate": self.fail_corner[env_ids].float().mean().item(),
+                "corner_rate": self.in_corner[env_ids].float().mean().item(),
                 "landed_rate": self.landed_on_cube[env_ids].float().mean().item(),
                 "grasp_tried": self.grasp_tried[env_ids].float().mean().item(),
                 "no_candidate_rate": self._skip[env_ids].float().mean().item(),
                 "chosen_predicted_open": self.chosen_opens[env_ids].float().mean().item(),
                 "pushes_used": self.push_count[env_ids].float().mean().item(),
             }
+        self.corner_count[env_ids] = 0
         self.push_count[env_ids] = 0  # landed_on_cube 는 밀 때마다 새로 계산되므로 리셋 안 함 (결과 읽기용)
 
         # 그리퍼: 대기 자세로
@@ -641,7 +652,7 @@ class Fr5PushEnv(DirectRLEnv):
                 [sample_uniform(-hx, hx, (n, M), dev), sample_uniform(-hy, hy, (n, M), dev)], dim=-1
             )
             cyaw = sample_uniform(-math.pi / 4, math.pi / 4, (n, M), dev)
-            ok = _rect_inside_tray(cand, cyaw, (h, h), hx, hy)
+            ok = _rect_inside_tray(cand, cyaw, (h, h), hx, hy) & ~self._corner_zone(cand)
             if i > 0:
                 ok &= ~_overlap_matrix(cand, cyaw, (h + cfg.min_gap / 2,) * 2, xy[:, :i], yaw[:, :i]).any(-1)
             score = torch.rand(n, M, device=dev)
@@ -680,7 +691,7 @@ class Fr5PushEnv(DirectRLEnv):
             cyaw = sample_uniform(-math.pi / 4, math.pi / 4, (n, M), dev)
             hit = _overlap_matrix(cand, cyaw, (h + cfg.min_gap / 2,) * 2, xy, yaw)  # (n, M, k)
             hit[ar, :, j] = False  # 자기 자신은 제외
-            ok = _rect_inside_tray(cand, cyaw, (h, h), hx, hy) & ~hit.any(-1)
+            ok = _rect_inside_tray(cand, cyaw, (h, h), hx, hy) & ~hit.any(-1) & ~self._corner_zone(cand)
             score = torch.linalg.norm(cand - xy[ar, t][:, None], dim=-1)
             score[~ok] = float("inf")
             best = score.argmin(dim=1)
@@ -694,6 +705,22 @@ class Fr5PushEnv(DirectRLEnv):
         xy = torch.gather(xy, 1, perm[..., None].expand(-1, -1, 2))
         yaw = torch.gather(yaw, 1, perm)
         return xy, yaw
+
+    def _corner_zone(self, c: torch.Tensor) -> torch.Tensor:
+        """배치용: 중심 c (..., 2) 가 모서리 금지 구역(두 벽 모두에서 corner_free 안)인가."""
+        hx, hy = self.cfg.tray_inner_half
+        f = self.cfg.corner_free
+        return (hx - c[..., 0].abs() < f) & (hy - c[..., 1].abs() < f)
+
+    def target_in_corner(self, xy: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
+        """대상(0번)이 모서리에 끼었나 (n,): x 벽 쪽과 y 벽 쪽 틈이 모두 잡기 틈(finger_clear_depth) 미만."""
+        hx, hy = self.cfg.tray_inner_half
+        h = CUBE / 2
+        c, th = xy[:, 0], yaw[:, 0]
+        gx = hx - c[:, 0].abs() - _extent(th, (h, h), torch.zeros_like(th))
+        gy = hy - c[:, 1].abs() - _extent(th, (h, h), torch.full_like(th, math.pi / 2))
+        d = self.cfg.finger_clear_depth
+        return (gx < d) & (gy < d)
 
     def sides_clear(self, xy: torch.Tensor, yaw: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """큐브 t 의 네 면(+x', -x', +y', -y') 바깥 손가락 영역이 비었는지. 반환 (n, 4) bool.

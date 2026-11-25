@@ -116,7 +116,7 @@ def evaluate(path):
     C = env.cfg.action_space
     k = torch.zeros(env.num_envs, dtype=torch.long, device=dev)
     by_k = [0] * (env.cfg.max_pushes + 1)
-    ep = succ = fail = blocked = 0
+    ep = succ = fail = blocked = corner = 0
     # 실패 원인 분석 (11/25): 판마다 기록
     nenv = env.num_envs
     zero = torch.zeros(nenv, dtype=torch.long, device=dev)
@@ -162,6 +162,7 @@ def evaluate(path):
             succ += (env.success & done).sum().item()
             fail += (env.failed & done).sum().item()
             blocked += (env.fail_blocked & done).sum().item()
+            corner += (env.fail_corner & done).sum().item()
             print(f"[eval] 밀기 {i + 1}/{args.pushes}", flush=True)
     print(f"\n===== 평가 ({args.eval_policy}): {path if args.eval_policy == 'cat' else '규칙'} | 시드 {args.seed + 1000}, 환경 {env.num_envs}개 =====")
     print(f"에피소드 {ep}개 (최대 {env.cfg.max_pushes}회 밀기)")
@@ -176,7 +177,7 @@ def evaluate(path):
     print(f"\n  --- 실패 원인 (전체 판 대비 %, 못 든 판 {nf}개) ---")
     print(f"  A. 3번 밀어도 '열림' 판정이 한 번도 안 남       {sum(cnt['A']) / E * 100:5.1f} %")
     print(f"  B. '열림'으로 잡기를 시도했지만 못 듦           {sum(cnt['B']) / E * 100:5.1f} %  (그중 참값으로는 안 열려 있던 판 {sum(cnt['B_closed']) / E * 100:4.1f} %)")
-    print(f"  F. 실패로 끝남 (넘어짐·쌓임·착지·시작점 막힘)  {sum(cnt['F']) / E * 100:5.1f} %")
+    print(f"  F. 실패로 끝남 (넘어짐·쌓임·착지·시작점 막힘·모서리)  {sum(cnt['F']) / E * 100:5.1f} %  (그중 모서리에 끼어 실패 {corner / E * 100:4.1f} %)")
     print("\n  --- 시작 배치의 벽 상황별 ---")
     names = {2: "벽 무관 (두 축 모두 벽은 OK)", 1: "한 축이 벽에 막힘", 0: "두 축 모두 벽에 막힘"}
     for w in (2, 1, 0):
