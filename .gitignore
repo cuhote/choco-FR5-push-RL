@@ -69,3 +69,11 @@ tests/
 
 # Docker history
 .isaac-lab-docker-history
+
+# 학습 결과 (모델은 GitHub Release로 공유)
+logs/
+outputs/
+*.pt
+*.pth
+*.onnx
+__pycache__/

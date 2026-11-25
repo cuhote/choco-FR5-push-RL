@@ -48,6 +48,7 @@ import fr5_push.tasks  # noqa: F401, E402
 def main(env_cfg, agent_cfg):
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs
+    env_cfg.residual_rule = args_cli.policy == "rl"  # rl 은 학습 때처럼 규칙+보정, 규칙 기준선은 점수 그대로
     if args_cli.max_pushes is not None:
         env_cfg.max_pushes = args_cli.max_pushes
         env_cfg.episode_length_s = (args_cli.max_pushes + 1) * env_cfg.decimation * env_cfg.sim.dt

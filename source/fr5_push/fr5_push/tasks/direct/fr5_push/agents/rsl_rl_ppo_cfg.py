@@ -11,7 +11,8 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 20  # 중간에 멈춰도 평가할 모델이 남도록
     experiment_name = "fr5_push"
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.5,  # 행동 범위가 [-1,1]이라 1.0이면 대부분 범위 밖으로 잘림
+        init_noise_std=0.3,  # 11/25: 규칙+보정에서 규칙 점수 차 0.5 는 약 12%, 1.0 은 약 1% 만 뒤집히게 (이전 0.5)
+        # 이전 설명: 행동 범위가 [-1,1]이라 1.0이면 대부분 범위 밖으로 잘림
         actor_obs_normalization=True,
         critic_obs_normalization=True,
         actor_hidden_dims=[256, 128, 64],

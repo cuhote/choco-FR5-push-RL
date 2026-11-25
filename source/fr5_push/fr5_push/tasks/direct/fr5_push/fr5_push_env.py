@@ -42,6 +42,9 @@ class Fr5PushEnv(DirectRLEnv):
         self.fail_tilt = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.fail_stack = torch.zeros(n, dtype=torch.bool, device=self.device)
         self.failed = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.fail_blocked = torch.zeros(n, dtype=torch.bool, device=self.device)  # 시작점 막힘 (안전한 후보 없음)
+        self._deficit_before = torch.zeros(n, device=self.device)  # 밀기 전 모자란 깊이 (틈 보상용)
+        self._deficit_after = torch.zeros(n, device=self.device)
 
     # ------------------------------------------------------------------ 장면
     def _setup_scene(self):
@@ -80,6 +83,8 @@ class Fr5PushEnv(DirectRLEnv):
         """
         self.actions = actions.clone()
         cand = self._cand
+        if self.cfg.residual_rule:  # 규칙 + 정책 보정
+            actions = actions + self.cfg.rule_weight * self.demo_push_action(lookahead=True)
         n = self.num_envs
         ar = torch.arange(n, device=self.device)
         scores = actions.masked_fill(~cand["valid"], float("-inf"))
@@ -95,6 +100,8 @@ class Fr5PushEnv(DirectRLEnv):
         # 손가락 Y면(평평한 면)이 미는 방향을 보게: yaw = theta + 90°. 양쪽 Y면이 같으니 [-90°, 90°)로
         self._yaw = torch.remainder(theta + math.pi, math.pi) - math.pi / 2
 
+        xy_t, yaw_t, _, _ = self.cubes_2d()  # 틈 보상: 밀기 전 참값
+        self._deficit_before = self.open_deficit(xy_t, yaw_t)
         self.set_finger_mode("push")
         jp = self._joint_targets(self._start, self.cfg.safe_tip_z)
         self.robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
@@ -138,6 +145,9 @@ class Fr5PushEnv(DirectRLEnv):
         xy = self._start + self._dir * s[:, None]
         tip_z = torch.where(self._skip, cfg.safe_tip_z, tip)  # 안전한 후보가 없던 환경은 내려가지 않음
         self.robot.set_joint_position_target(self._joint_targets(xy, tip_z))
+        if cfg.lock_fingers_push:  # 손가락을 닫힘 위치에 고정 (실물 그리퍼는 닫힌 채 위치를 유지)
+            zf = torch.zeros(self.num_envs, len(self._fingers), device=self.device)
+            self.robot.write_joint_state_to_sim(zf, zf, joint_ids=self._fingers)
 
         # 내려가기 끝 + 0.1초 (관절이 목표를 따라잡을 시간): 손가락 끝이 목표 높이에 못 갔으면 큐브 위에 내려앉은 것
         if self._sub == round((t1 + 0.1) / self.physics_dt):
@@ -207,11 +217,25 @@ class Fr5PushEnv(DirectRLEnv):
             for key, val in vals:
                 out[key].append(val)
 
+        def wall_room(pj, yj, u):
+            """큐브 j 가 u 방향으로 벽(어느 모서리든)에 닿기까지 중심이 갈 수 있는 거리 (n,)."""
+            room = torch.full((n,), 1.0, device=self.device)
+            for ang, W in ((0.0, hx), (math.pi, hx), (math.pi / 2, hy), (-math.pi / 2, hy)):
+                nx, ny = math.cos(ang), math.sin(ang)
+                un = u[:, 0] * nx + u[:, 1] * ny
+                gap = W - (pj[:, 0] * nx + pj[:, 1] * ny) - _extent(yj, (h, h), torch.full_like(yj, ang))
+                room = torch.where(un > 1e-6, torch.minimum(room, gap / un.clamp(min=1e-6)), room)
+            return room.clamp(min=0.0)
+
         def add(j, pj, yj, u, near_ok):
-            """큐브 j 를 u 방향으로 미는 후보 (거리별로 추가). 결과 예상 = 회전 없이 밀린 만큼 이동."""
-            for dist in cfg.cand_dists:
-                d = torch.full((n,), dist, device=self.device)
-                add_one(j, pj, yj, u, near_ok, d, pj + u * (dist - cfg.start_clearance), yj)
+            """큐브 j 를 u 방향으로 미는 후보 (거리별로 추가). 결과 예상 = 회전 없이 밀린 만큼 이동.
+            벽 앞 멈춤: 민 큐브가 벽 wall_push_gap 앞에 오면 그리퍼를 멈춤 (벽에 눌러 끼우면 들 때 딸려 올라감,
+            실물에서는 큐브를 벽에 세게 누름). 줄인 거리로 큐브를 3mm 도 못 밀면 후보에서 뺌."""
+            max_d = wall_room(pj, yj, u) - cfg.wall_push_gap + cfg.start_clearance
+            for dist in cfg.cand_dists:  # 큐브가 밀리는 거리 -> 손가락 이동 = + start_clearance
+                d = torch.clamp(torch.full((n,), dist + cfg.start_clearance, device=self.device), max=max_d)
+                ok = near_ok & (d >= cfg.start_clearance + 0.003)
+                add_one(j, pj, yj, u, ok, d, pj + u * (d - cfg.start_clearance)[:, None], yj)
 
         # (1) 이웃 밀기: 가까운 이웃 순서대로, 양쪽 옆면 x 방향 (0° 옆으로 비키기 ~ 90° 대상 반대쪽으로)
         for rank in range(cfg.cand_neighbours):
@@ -266,9 +290,11 @@ class Fr5PushEnv(DirectRLEnv):
                 # 벽 따라 밀기
                 for sgn in (1.0, -1.0):
                     t = sgn * torch.stack([-nw[:, 1], nw[:, 0]], dim=-1)
-                    for dd in cfg.cand_dists:
-                        d = torch.full((n,), dd, device=self.device)
-                        add_one(zero, c, yt, t, near_w, d, c + t * (dd - cfg.start_clearance), yt)
+                    max_d = wall_room(c, yt, t) - cfg.wall_push_gap + cfg.start_clearance
+                    for dd in cfg.cand_dists:  # 큐브 기준 거리
+                        d = torch.clamp(torch.full((n,), dd + cfg.start_clearance, device=self.device), max=max_d)
+                        ok = near_w & (d >= cfg.start_clearance + 0.003)
+                        add_one(zero, c, yt, t, ok, d, c + t * (d - cfg.start_clearance)[:, None], yt)
         return {key: torch.stack(val, dim=1) for key, val in out.items()}
 
     def landing_free(self, start, end, theta, xy, yaw, margin: float = 0.0) -> torch.Tensor:
@@ -324,13 +350,21 @@ class Fr5PushEnv(DirectRLEnv):
         return xy, yaw, upright, p[..., 2]
 
     def cubes_observed(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """카메라 측정을 흉내: 참 위치·yaw 에 가우시안 노이즈 (obs_pos_noise_std, obs_yaw_noise_deg). 매번 새로 뽑음."""
+        """카메라 측정을 흉내: 참 위치·yaw 에 노이즈 (obs_pos_noise_std, obs_yaw_noise_deg). 매번 새로 뽑음.
+
+        obs_noise_dist "uniform": 각 값에 [-크기, +크기] 균등 / "normal": 크기를 σ 로 하는 가우시안.
+        """
         cfg = self.cfg
         xy, yaw, _, _ = self.cubes_2d()
+        uniform = getattr(cfg, "obs_noise_dist", "normal") == "uniform"
+
+        def noise(t):
+            return (torch.rand_like(t) * 2 - 1) if uniform else torch.randn_like(t)
+
         if cfg.obs_pos_noise_std > 0:
-            xy = xy + torch.randn_like(xy) * cfg.obs_pos_noise_std
+            xy = xy + noise(xy) * cfg.obs_pos_noise_std
         if cfg.obs_yaw_noise_deg > 0:
-            yaw = yaw + torch.randn_like(yaw) * math.radians(cfg.obs_yaw_noise_deg)
+            yaw = yaw + noise(yaw) * math.radians(cfg.obs_yaw_noise_deg)
         return xy, yaw
 
     # ------------------------------------------------------------------ 잡기 (검증용: 실제로 집어서 들어 보기)
@@ -368,7 +402,7 @@ class Fr5PushEnv(DirectRLEnv):
                 tip, finger = fn((i + 1) / steps)
                 self.robot.set_joint_position_target(targets(tip, finger))
                 self.scene.write_data_to_sim()
-                self.sim.step(render=False)
+                self.sim.step(render=self.sim.has_gui())  # 화면을 켰을 때만 잡기 동작도 그림 (학습은 headless라 영향 없음)
                 self.scene.update(dt)
             if getattr(self, "debug_grasp", False):
                 jp = self.robot.data.joint_pos[0]
@@ -414,7 +448,9 @@ class Fr5PushEnv(DirectRLEnv):
             return score
         if "deficit" not in cand:  # 관측에서 이미 계산했으면 재사용
             cand["deficit"], cand["next_open"] = self.lookahead_info(cand, self._obs_yaw, topk)
-        score2 = 1.0 * cand["next_open"].float() - 10.0 * cand["deficit"] + order_bonus
+        # 다음 수 열림(+4)이 우선, 그다음 모자란 깊이 1mm 당 -0.1 (최대 36mm -> -3.6 < 4 라 순서는 이전과 같음).
+        # 이전 (1, -10/m) 은 10mm 차이가 0.1점이라 정책 노이즈(0.3~0.5)에 묻혔음 (11/25)
+        score2 = 4.0 * cand["next_open"].float() - 100.0 * cand["deficit"] + order_bonus
         return torch.where(stuck[:, None], score2, score)
 
     def lookahead_info(self, cand: dict, yaw: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -509,6 +545,9 @@ class Fr5PushEnv(DirectRLEnv):
         r += cfg.rew_push
         r += cfg.rew_per_cm * (self._dist * 100.0)
         r += cfg.rew_fail * self.failed.float()
+        # 틈 보상: 모자란 깊이가 줄어든 mm 당 +0.17 (늘면 감점). 실패한 판은 주지 않음
+        gain_mm = (self._deficit_before - self._deficit_after) * 1000.0
+        r += cfg.rew_gap_per_mm * gain_mm * (~self.failed).float()
         return r
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -523,7 +562,9 @@ class Fr5PushEnv(DirectRLEnv):
         # 실패: 대상이 기울어짐 / 큐브가 쌓임 / 그리퍼가 큐브 위에 내려앉음(실물에서는 충돌·정지)
         self.fail_tilt = ~upright[:, 0]
         self.fail_stack = (z > cfg.stacked_z).any(-1)
-        self.failed = self.fail_tilt | self.fail_stack | self.landed_on_cube
+        self.fail_blocked = self._skip & cfg.fail_on_blocked
+        self.failed = self.fail_tilt | self.fail_stack | self.landed_on_cube | self.fail_blocked
+        self._deficit_after = self.open_deficit(xy, yaw)  # 틈 보상: 밀기 후 참값 (잡기 전에 계산)
         # 참값으로 본 "한 축 열림" (분석용)
         self.axis_open = self.grasp_axes_clear(xy, yaw, t0).any(-1) & ~self.failed
 
@@ -557,6 +598,7 @@ class Fr5PushEnv(DirectRLEnv):
             self.extras["log"] = {
                 "success_rate": self.success[env_ids].float().mean().item(),
                 "fail_rate": self.failed[env_ids].float().mean().item(),
+                "blocked_rate": self.fail_blocked[env_ids].float().mean().item(),
                 "landed_rate": self.landed_on_cube[env_ids].float().mean().item(),
                 "grasp_tried": self.grasp_tried[env_ids].float().mean().item(),
                 "no_candidate_rate": self._skip[env_ids].float().mean().item(),
@@ -656,7 +698,7 @@ class Fr5PushEnv(DirectRLEnv):
     def sides_clear(self, xy: torch.Tensor, yaw: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """큐브 t 의 네 면(+x', -x', +y', -y') 바깥 손가락 영역이 비었는지. 반환 (n, 4) bool.
 
-        손가락 영역 = 면에서 바깥으로 깊이 finger_clear_depth, 폭 finger_clear_width. 다른 큐브·벽이 없어야 빔.
+        손가락 영역 = 면에서 바깥으로 깊이 finger_clear_depth (벽은 + finger_wall_extra), 폭 finger_clear_width. 다른 큐브·벽이 없어야 빔.
         xy: (n, k, 2) 트레이 중심 기준, yaw: (n, k), t: (n,) 대상 인덱스.
         """
         cfg = self.cfg
@@ -673,7 +715,9 @@ class Fr5PushEnv(DirectRLEnv):
             u = torch.stack([torch.cos(a), torch.sin(a)], dim=-1)
             for sgn in (1.0, -1.0):
                 rc = c + sgn * u * (h + cfg.finger_clear_depth / 2)  # 손가락 영역 중심
-                ok = _rect_inside_tray(rc, a, region_half, hx, hy)
+                # 벽: 손가락 윗부분(더 두꺼움)이 벽 높이에 걸리므로 finger_wall_extra 만큼 더 깊게 검사
+                dw = cfg.finger_clear_depth + cfg.finger_wall_extra
+                ok = _rect_inside_tray(c + sgn * u * (h + dw / 2), a, (dw / 2, region_half[1]), hx, hy)
                 hit = _overlap_matrix(rc[:, None], a[:, None], region_half, xy, yaw)[:, 0]  # (n, k)
                 out.append(ok & ~(hit & not_self).any(-1))
         return torch.stack(out, dim=-1)

@@ -34,11 +34,17 @@ import fr5_push.tasks  # noqa: F401, E402
 
 def main():
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+    env_cfg.residual_rule = False  # 규칙 기준선: 넘겨준 점수 그대로 실행
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped  # Fr5PushEnv
     env.reset()
 
     episodes = successes = failures = first_total = first_success = landed = pushes = 0
+    k = torch.zeros(u.num_envs, dtype=torch.long, device=u.device)  # 이번 판에서 몇 번째 밀기인지
+    by_k = [0] * (u.cfg.max_pushes + 1)  # 실제로 들어 올린 판: k 번째 밀기에서 성공한 수
+    open_by_k = [0] * (u.cfg.max_pushes + 1)  # 참값 '한 축 열림'(틈 기준만, 팀 비교용)이 처음 된 밀기
+    opened = torch.zeros(u.num_envs, dtype=torch.bool, device=u.device)
+    blocked = 0
     i = 0
     while simulation_app.is_running() and (args_cli.pushes == 0 or i < args_cli.pushes):
         with torch.inference_mode():
@@ -52,6 +58,14 @@ def main():
             _, _, terminated, truncated, _ = env.step(actions)
             done = terminated | truncated
         # u.success / u.failed / u.landed_on_cube 는 리셋 직전 값이 보관돼 있음
+        k += 1
+        for j in range(1, u.cfg.max_pushes + 1):
+            by_k[j] += (u.success & done & (k == j)).sum().item()
+            open_by_k[j] += (u.axis_open & ~opened & (k == j)).sum().item()
+        opened |= u.axis_open
+        k[done] = 0
+        opened[done] = False
+        blocked += (u.fail_blocked & done).sum().item()
         episodes += done.sum().item()
         successes += (u.success & done).sum().item()
         failures += (u.failed & done).sum().item()
@@ -69,9 +83,14 @@ def main():
         print(f"\n===== {args_cli.policy} 결과 =====")
         print(f"에피소드 {episodes}개 (최대 {u.cfg.max_pushes}회 밀기)")
         print(f"  성공률            {successes / episodes * 100:5.1f} %")
-        print(f"  실패(넘어짐/쌓임)  {failures / episodes * 100:5.1f} %")
+        print(f"  실패(전체)        {failures / episodes * 100:5.1f} %  (그중 시작점 막힘 {blocked / episodes * 100:4.1f} %)")
         print(f"  첫 밀기로 성공     {first_success / max(first_total, 1) * 100:5.1f} %")
         print(f"  큐브 위에 착지     {landed / pushes * 100:5.1f} % (밀기 1회당)")
+        cum = cum_o = 0
+        for j in range(1, u.cfg.max_pushes + 1):
+            cum += by_k[j]
+            cum_o += open_by_k[j]
+            print(f"  {j}번 안에: 실제로 들어 올림 {cum / episodes * 100:5.1f} % | 참값 한 축 열림(틈 기준) {cum_o / episodes * 100:5.1f} %")
     env.close()
 
 

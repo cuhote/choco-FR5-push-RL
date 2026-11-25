@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<robot name="pgea_100_40_o" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:include filename="$(find pgea_description)/urdf/pgea_100_40_o.xacro"/>
+  <link name="flange"/>
+  <xacro:pgea_100_40_o parent="flange" xyz="0 0 0"/>
+</robot>

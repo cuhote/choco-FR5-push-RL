@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, RigidObjectCfg, RigidObjectCollectionCfg
@@ -7,19 +10,23 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
 # ---------------------------------------------------------------- 실측값 (m)
-GRIPPER_USD = "/home/dync/cuhote_ws/assets/pgea/usd/pgea_floating.usd"
+# 로봇 파일은 레포 안 assets/ 에 둔다 (11/26). 다른 위치를 쓰려면 환경 변수 FR5_PUSH_ASSETS 로 지정
+#   이 파일: <레포>/source/fr5_push/fr5_push/tasks/direct/fr5_push/fr5_push_env_cfg.py -> parents[6] = <레포>
+ASSETS_DIR = Path(os.environ.get("FR5_PUSH_ASSETS", Path(__file__).resolve().parents[6] / "assets"))
+GRIPPER_USD = str(ASSETS_DIR / "usd" / "pgea_floating" / "pgea_floating.usd")  # 떠 있는 PGEA 그리퍼 (px, py, pz, yaw)
+FR5_PGEA_USD = str(ASSETS_DIR / "usd" / "fr5_pgea_v2" / "fr5_pgea_v2.usd")  # FR5 + PGEA + D435 (FR5 학습용, 아직 환경에 연결 안 함)
 TCP_OFFSET = 0.160  # 플랜지 면 -> 손가락 끝
 CUBE = 0.025  # 큐브 한 변
-NUM_CUBES = 18  # Cube_00 = 대상(빨강), 나머지 = 이웃(노랑)
+NUM_CUBES = 19  # 실물: 글자 16개(E·L·P 2개씩) + 숫자 3개. Cube_00 = 대상(빨강), 나머지 = 이웃(노랑)
 
 # 트레이 = 손잡이 쟁반 (상품 표기 40 x 27.5 cm, 높이 2 cm). 바닥 윗면 = z 0
 # ★가정★ 40 x 27.5 를 안쪽 크기로 사용 (손잡이 포함 바깥 크기라면 실제 바닥은 더 좁음 -> 실측 후 수정)
 #        테두리는 수직 벽으로 단순화 (실제는 약간 비스듬함), 모서리는 직각
 # 이전 트레이(240 x 320, 벽 80mm)는 하우징이 벽에 걸려 못 푸는 경우가 많았음 -> 낮은 테두리는 하우징·카메라가 위로 지나감
-TRAY_IN_X = 0.400  # 안쪽 가로 (x)
-TRAY_IN_Y = 0.275  # 안쪽 세로 (y)
-TRAY_WALL_H = 0.020  # 테두리 높이
-TRAY_WALL_T = 0.005  # 테두리 두께 (가정)
+TRAY_IN_X = 0.300  # 안쪽 가로 (x) - 상자 30 x 30, 높이 3cm (2026-11-23)
+TRAY_IN_Y = 0.300  # 안쪽 세로 (y)
+TRAY_WALL_H = 0.030  # 테두리 높이
+TRAY_WALL_T = 0.008  # 테두리 두께 (실측)
 TRAY_CORNER = 0.0  # 모서리 삼각형 블록 변 길이 (0 = 없음, 직각 모서리)
 _H, _T = TRAY_WALL_H, TRAY_WALL_T
 _OX, _OY = TRAY_IN_X + 2 * _T, TRAY_IN_Y + 2 * _T  # 바깥 크기
@@ -92,7 +99,7 @@ T_DESCEND, T_PUSH, T_LIFT, T_SETTLE = 0.4, 1.6, 0.4, 0.4
 PUSH_STEPS = round((T_DESCEND + T_PUSH + T_LIFT + T_SETTLE) / SIM_DT)  # 336 물리 스텝 = 행동 1번
 MAX_PUSHES = 3  # 대상 하나당 최대 밀기 횟수 (2번 58.8% / 3번 64.7%, 규칙 기준 측정). 넘으면 사람 호출
 CAND_NEIGHBOURS = 6  # 후보: 가까운 이웃 6개
-CAND_DISTS = (0.040, 0.030)  # 후보: 미는 거리 2종 (앞쪽을 규칙이 우선)
+CAND_DISTS = (0.035, 0.025, 0.015)  # 후보: 큐브가 밀리는 거리 3종 (11/25 변경, 이전 손가락 기준 40/30). 손가락 이동 = 이 값 + start_clearance. 앞쪽을 규칙이 우선
 CAND_TARGET = True  # 후보: 대상 자체를 네 면 방향으로 밀기
 CAND_ANGLES = (0.0, 22.5, 45.0, 67.5, 90.0)  # 이웃 미는 방향: 0 = 옆으로 비키기, 90 = 대상 반대쪽으로 곧게 (사이 각도는 섞음)
 # 이웃 6 x 옆면 2 x 방향 5 x 거리 2 = 120, 대상 4면 x 거리 2 = 8 -> 128
@@ -133,9 +140,10 @@ class Fr5PushEnvCfg(DirectRLEnvCfg):
     cand_wall = CAND_WALL
     cand_wall_square = False  # 벽 맞추기 후보 사용 여부 (면 법선 밀기: 예측 열림 94% vs 실제 5% -> 꺼 둠)
     wall_square_mode = "normal"  # "normal" 벽과 직각으로 밀기 / "face" 큐브 면 법선으로 밀기
+    wall_push_gap = 0.003  # 밀기 후보: 민 큐브가 벽 3mm 앞에 오면 그리퍼 멈춤 (벽에 눌러 끼움 방지 = 쌓임의 주원인)
     wall_stop_gap = 0.002  # 벽 맞추기: 큐브가 벽에 닿기 2mm 전에 그리퍼 멈춤 (벽에 큐브를 눌러 끼우지 않게)
-    safety_margin = 0.004  # 안전 필터 여유: 착지 자리·하우징 검사 면적을 4mm 넓혀 검사 (카메라 오차 대비)
-    start_clearance = 0.008  # 후보: 밀 큐브 옆면에서 8mm 떨어져 내림 (안전 여유 4mm보다 크게)
+    safety_margin = 0.002  # 안전 필터 여유: 착지 자리·하우징 검사 면적을 2mm 넓혀 검사 (11/25 변경, 이전 4mm)
+    start_clearance = 0.005  # 후보: 밀 큐브 옆면에서 5mm 떨어져 내림 (11/25 변경, 이전 8mm). 안전 여유보다 커야 함
     # 실패 판정
     landed_tol = 0.003  # 내려간 뒤 손가락 끝이 목표보다 3mm 넘게 높음 = 큐브 위에 내려앉음
     tilt_fail_deg = 15.0  # 큐브가 15° 넘게 기울어 있음 (모서리로 서거나 다른 큐브에 기댐)
@@ -149,7 +157,10 @@ class Fr5PushEnvCfg(DirectRLEnvCfg):
     rew_success = 10.0
     rew_push = -1.0  # 밀기 1회
     rew_per_cm = -0.1  # 민 거리 1cm 당
-    rew_fail = -5.0  # 넘어짐 / 쌓임 / 큐브 위 착지
+    rew_fail = -5.0  # 넘어짐 / 쌓임 / 큐브 위 착지 / 시작점 막힘(안전한 후보 없음)
+    rew_gap_per_mm = 0.17  # 틈 보상 (11/25): 대상이 열리기까지 모자란 깊이(open_deficit, 참값)가 줄어든 1mm 당. 늘면 감점
+    fail_on_blocked = True  # 안전한 후보가 하나도 없으면 실패(-5)로 끝냄 (11/25 변경, 이전: 밀기 1회만 소모)
+    lock_fingers_push = True  # 밀 때 손가락을 닫힘 위치에 고정 (실물처럼). False 면 PD 로 당김 (최대 약 3mm 벌어졌음)
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=16, env_spacing=0.6, replicate_physics=True)
 
     robot_cfg: ArticulationCfg = GRIPPER_CFG
@@ -167,28 +178,46 @@ class Fr5PushEnvCfg(DirectRLEnvCfg):
     wall_case_prob = 0.2  # 벽 때문에만 막힌 큐브를 대상으로 허용하는 비율 (나머지는 이웃 큐브 때문에 막힌 경우)
 
     # 잡기 판정 (E단계 성공 조건과 같은 함수 사용)
-    # 큐브 면에서 바깥으로 필요한 빈 깊이 = (벌림 19.5 - 큐브 반 12.5) + 손가락 두께 13 + 여유 0.5
-    # (16mm 였을 때 카메라 노이즈가 있으면 "열림" 판정의 77% 만 실제로 잡힘 -> 20.5mm 에서 97.6%)
-    finger_clear_depth = 0.0205
-    finger_clear_width = 0.022  # 손가락 폭 20 + 여유 2 (손가락 Y 폭 실측 후 수정)
-    housing_half = (0.0275, 0.020)  # 하우징 반 크기 (잡기 축 방향, 직각 방향) - 벽 충돌 검사
+    # 손가락 실측 (2026-11-23): 길이 33, 폭(Y) 14, 끝 14mm 구간이 8 -> 3mm 로 얇아짐, 그 위(나사 높이)는 11mm
+    # 큐브 면에서 바깥으로 필요한 빈 깊이 = (벌림 19.5 - 큐브 반 12.5) + 큐브 윗면 높이의 손가락 두께 7.5 + 여유 0.5
+    #   (잡을 때 손가락 끝 12.5mm -> 큐브 윗면 25mm 는 끝에서 12.5mm 위 -> 3 + 5 x 12.5/14 = 7.5mm)
+    # 벽 쪽은 손가락 윗부분(나사 높이 11mm)이 벽(30mm) 높이에 걸려서 3.5mm 더 필요
+    # ★실물 기준으로 맞춤 (11/24, choco_ws points.yaml GAP_MIN 18 / FINGER_WIDTH 20, 설계서 5.3절)★
+    #   실물 잡기 판정과 같은 기준이어야 정책이 멈춘 상태를 실물도 '열림'으로 봄. 벽 쪽도 18mm 하나로 씀
+    #   (벌림 15.4 - 큐브 반 12.5 = 2.9 + 손가락 위쪽 두께 11 + 여유 0.5 = 14.4mm < 18 이라 벽 쪽도 충분)
+    finger_clear_depth = 0.018  # 이전 0.015
+    finger_wall_extra = 0.0  # 이전 0.0035
+    finger_clear_width = 0.020  # 이전 0.016. 실물 FINGER_WIDTH 20 (가정, 실측 필요)
+    housing_half = (0.0365, 0.0115)  # 하우징(움직이지 않는 회색) 반 크기 (잡기 축 방향, 직각 방향) - 실측 73 x 23mm. 벽 충돌 검사
     # D435 + 흰색 브래킷: 아래를 수직으로 봄. ★추정값 (사진 비율) - 실측 후 교체★
     #   위치를 몰라서 그리퍼 중심 기준으로 브래킷 판 전체를 덮는 넉넉한 상자로 잡음
+    # 카메라(D435, 가로 88mm 가 손가락 벌림 방향과 나란)는 그리퍼 중심에서 Y 로 약 60mm 떨어져 있음 (사진 추정).
+    # 충돌 검사는 그리퍼 중심 기준 상자로 넉넉히 덮음 (벽 30mm < 카메라 아래면이라 실제로는 검사 안 걸림)
     camera_half = (0.055, 0.045)  # 반 크기 (그리퍼 X = 손가락 벌림 방향, 그리퍼 Y)
-    camera_bottom_above_tip = 0.055  # 카메라 아래 면이 손가락 끝보다 55mm 위 (플랜지에서 약 105mm)
+    camera_bottom_above_tip = 0.061  # 실측: 플랜지 -> 판 아래 74mm + 카메라 25mm = 99mm, 손가락 끝 160mm -> 61mm 위
     tray_wall_height = TRAY_WALL_H  # 트레이 벽 높이 (바닥 윗면 기준)
     housing_bottom_above_tip = 0.038  # 하우징 아래 면 = 손가락 끝 + 38mm (실측)
-    grasp_tip_z = CUBE / 2  # 잡을 때 손가락 끝 높이 (큐브 중간 = 위쪽 절반을 잡음)
+    grasp_tip_z = 0.012  # 잡을 때 손가락 끝 높이. 실물 Z_TIP_ABOVE_FLOOR 12mm (이전 12.5mm)
     # 손가락 PD (stiffness, damping, 최대 힘 N): 밀 때 / 잡을 때 다르게 (fr5_push_env.set_finger_mode)
     finger_gains = {"push": (2000.0, 100.0, 100.0), "grasp": (200.0, 20.0, 5.0)}
-    grasp_open_each = 0.0195  # 잡기 전 벌림: 손가락마다 19.5mm (약 89%, 합 39mm). 70% 면 카메라 오차에 약함
+    grasp_open_each = 0.0154  # 잡기 전 벌림: 실물 GRIP_OPEN_PCT 70% = 합 30.8mm (이전 19.5mm = 89%). E단계: 70% 는 노이즈에서 잡힘이 줄었음 -> 측정으로 확인
     grasp_ok_range = (0.0123, 0.0132)  # 잡기 성공 위치값 56~60% (손가락마다, 실물 메모 기준)
     obs_lookahead = True  # 후보마다 탐색 정보(모자란 깊이, 다음 수에 열림)를 관측에 추가 (False 면 관측 611)
     lookahead_topk = 6  # 다음 수를 펼쳐 볼 후보 수 (탐색 규칙과 같음)
+    # 규칙 + 정책 보정 (11/25): 실행 점수 = rule_weight x 탐색 규칙 점수 + 정책 점수(행동).
+    #   정책이 아무것도 모를 때도 규칙 수준으로 행동하고, 정책은 규칙이 틀리는 경우만 보정하도록 배움.
+    #   규칙 점수 단위: 열림 예측 +2, (줄줄이 밀림 없음) +0.5 / 막힘일 때 다음 수 열림 +4, 모자란 깊이 1mm 당 -0.1
+    #   규칙 기준선을 잴 때(push_demo, evaluate 의 demo/look/random)는 False 로 둔다.
+    residual_rule = True
+    rule_weight = 1.0
     do_grasp = True  # 밀기 후 "열림" 판정이면 실제로 잡아서 들기. 성공 = 실제로 들림 (False 면 성공 = 한 축 열림)
 
     # 카메라 측정 노이즈 (D435 흉내). 계획(관측·후보·안전 검사)에만 적용, 물리·성공 판정은 참값
-    obs_pos_noise_std = 0.002  # 위치 σ 2mm
-    obs_yaw_noise_deg = 2.0  # 각도 σ 2°
-    finger_foot_half = (0.0105, 0.0105)  # 닫힌 손가락이 밀 때 차지하는 바닥 면적 (반 크기, 약 21 x 21mm)
+    # 설계서 인식 오차 ±3mm, ±5° (11/24). uniform = x, y, yaw 각각 [-크기, +크기] 균등 / normal = 크기가 σ
+    obs_noise_dist = "uniform"
+    obs_pos_noise_std = 0.003  # 위치 노이즈 크기 (이전 normal σ 2mm)
+    obs_yaw_noise_deg = 5.0  # 각도 노이즈 크기 (이전 normal σ 2°)
+    # 닫힌 손가락이 밀 때 차지하는 바닥 면적 (반 크기). (미는 방향 = 손가락 폭 14, 직각 = 두 손가락 두께)
+    # 밀 때 끝 17mm -> 벽 30mm 높이(끝에서 13mm 위)의 두께 3 + 5 x 13/14 = 7.6mm x 2 -> 15.3mm
+    finger_foot_half = (0.0070, 0.0077)
 
